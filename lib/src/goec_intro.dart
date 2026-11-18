@@ -15,14 +15,20 @@ import 'geometry.dart';
 /// logo plays. At the end the camera flies through the bolt in the logo and the child is
 /// revealed through it; then the intro removes itself and [onFinished] is called.
 ///
+/// With [ready], the camera waits on the lit bolt until the child is ready, with the bolt
+/// glowing softly, then flies in. It waits at most [maxWait].
+///
 /// Phones with reduced motion turned on, or that can't keep up during the first frames,
-/// get the static splash (the finished logo) for [staticHold], then fade to the child.
+/// get the static splash (the finished logo) for [staticHold] (and until [ready]), then
+/// fade to the child.
 class GoEcIntro extends StatefulWidget {
   const GoEcIntro({
     super.key,
     required this.child,
     this.onFinished,
     this.onFallback,
+    this.ready,
+    this.maxWait = const Duration(seconds: 10),
     this.rollLetters = true,
     this.staticHold = const Duration(milliseconds: 900),
     this.skipOnSlowFrames = true,
@@ -30,6 +36,18 @@ class GoEcIntro extends StatefulWidget {
 
   final Widget child;
   final VoidCallback? onFinished;
+
+  /// Completes when [child] is ready to be seen. In Go EC: the map is created and the
+  /// charger markers are on it. If it hasn't completed by the time the animation reaches
+  /// the bolt, the camera stops there and the bolt glows softly until it does.
+  ///
+  /// Null (the default) means no waiting. An error counts as ready. Create the future
+  /// once (for example in `initState`), not in a build method.
+  final Future<void>? ready;
+
+  /// The longest the intro waits for [ready], counted from its first frame. After that it
+  /// goes into [child] anyway, and the screen shows its own loading or offline state.
+  final Duration maxWait;
 
   /// Called if the still logo is shown instead of the animation, with the reason.
   /// Useful for analytics: how many users get the fallback.
@@ -128,6 +146,8 @@ class _Timeline {
   static const portalFade = diveDur * 0.12;
   static const end = diveStart + diveDur;
   static const settled = sparkStart + sparkDur; // the finished splash, used for the static fallback
+  static const holdAt = diveStart; // waits here, before the camera moves, if the child isn't ready
+  static const pulse = 1200.0; // one soft glow of the bolt while waiting
 }
 
 /// Arrivals: full speed from the first frame, held until [brakeAt], then a cosine brake
@@ -210,6 +230,11 @@ class _GoEcIntroState extends State<GoEcIntro> with TickerProviderStateMixin {
   late final AnimationController _fadeOut = AnimationController(vsync: this, duration: _fadeDur);
   final ValueNotifier<double> _clock = ValueNotifier<double>(0);
   final ValueNotifier<double> _frozen = ValueNotifier<double>(0);
+  // Waiting on the bolt: runs 0 → 1 once per glow (the painter turns it into 0 → 1 → 0).
+  late final AnimationController _pulse = AnimationController(
+    vsync: this,
+    duration: Duration(milliseconds: _Timeline.pulse.round()),
+  );
   final ValueNotifier<bool> _showChild = ValueNotifier<bool>(false);
   final List<Duration> _gaps = [];
   Duration? _lastFrame;
@@ -217,6 +242,16 @@ class _GoEcIntroState extends State<GoEcIntro> with TickerProviderStateMixin {
   bool _static = false;
   bool _started = false;
   Timer? _hold;
+
+  // Waiting for [GoEcIntro.ready].
+  bool _ready = false;
+  bool _gaveUp = false; // maxWait ran out
+  bool _holding = false; // stopped on the bolt (or easing out of the glow)
+  bool _resuming = false;
+  bool _staticHeld = false; // the still logo has been up for staticHold
+  bool _leaving = false;
+  Timer? _deadline;
+  bool get _mayGo => _ready || _gaveUp;
 
   // Debug builds are always slow, so the check only runs in profile and release.
   bool get _checkFrames => widget.skipOnSlowFrames && (!kDebugMode || GoEcIntro.debugCheckFrames);
@@ -228,6 +263,36 @@ class _GoEcIntroState extends State<GoEcIntro> with TickerProviderStateMixin {
     _controller.addStatusListener((s) {
       if (s == AnimationStatus.completed) _finish();
     });
+    _listen(widget.ready);
+  }
+
+  @override
+  void didUpdateWidget(GoEcIntro old) {
+    super.didUpdateWidget(old);
+    if (_ready || identical(old.ready, widget.ready)) return;
+    _listen(widget.ready);
+    if (_ready) _release();
+  }
+
+  void _listen(Future<void>? ready) {
+    if (ready == null) {
+      _ready = true;
+      return;
+    }
+    ready.then((_) => _onReady(ready), onError: (Object _) => _onReady(ready));
+  }
+
+  void _onReady(Future<void> from) {
+    if (!mounted || _ready || !identical(from, widget.ready)) return;
+    _ready = true;
+    _deadline?.cancel();
+    _release();
+  }
+
+  void _onDeadline() {
+    if (!mounted || _mayGo) return;
+    _gaveUp = true;
+    _release();
   }
 
   @override
@@ -235,6 +300,7 @@ class _GoEcIntroState extends State<GoEcIntro> with TickerProviderStateMixin {
     super.didChangeDependencies();
     if (_started) return;
     _started = true;
+    if (!_mayGo) _deadline = Timer(widget.maxWait, _onDeadline);
     if (MediaQuery.maybeOf(context)?.disableAnimations ?? false) {
       _showStatic(GoEcFallback.reducedMotion); // build runs next anyway
     } else {
@@ -244,9 +310,39 @@ class _GoEcIntroState extends State<GoEcIntro> with TickerProviderStateMixin {
 
   void _onTick() {
     final ms = _controller.value * _Timeline.end;
+    if (!_mayGo && !_holding && ms >= _Timeline.holdAt) {
+      _startHold();
+      return;
+    }
     _clock.value = ms;
     if (ms >= _Timeline.portalOpen) _showChild.value = true;
     if (_checkFrames && _gaps.length < _probeFrames) _measure();
+  }
+
+  // The child isn't ready: stop on the frame before the dive and let the bolt glow.
+  void _startHold() {
+    _holding = true;
+    // Stops the controller and lands exactly on the hold frame (this calls _onTick again).
+    _controller.value = _Timeline.holdAt / _Timeline.end;
+    _pulse.repeat();
+  }
+
+  // Ready, or done waiting: carry on.
+  void _release() {
+    if (_static) {
+      _tryLeaveStatic();
+    } else if (_holding && !_resuming) {
+      _resuming = true;
+      // Finish the glow back to rest the short way, so the dive starts from the exact
+      // frame the camera stopped on.
+      final toRest = _pulse.value < 0.5 ? _pulse.reverse() : _pulse.forward();
+      toRest.whenCompleteOrCancel(() {
+        if (!mounted) return;
+        _holding = false;
+        _pulse.value = 0; // forward() rests at 1, which is the same frame; keep it at 0
+        _controller.forward();
+      });
+    }
   }
 
   void _measure() {
@@ -260,7 +356,8 @@ class _GoEcIntroState extends State<GoEcIntro> with TickerProviderStateMixin {
     if (sorted[sorted.length ~/ 2] > _slowGap) setState(() => _showStatic(GoEcFallback.slowPhone, fade: true));
   }
 
-  // Holds the finished logo (no dive) for [GoEcIntro.staticHold], then fades to the child.
+  // Holds the finished logo (no dive) for [GoEcIntro.staticHold] and until the child is
+  // ready (within maxWait), then fades to the child. No glow: it is the still version.
   void _showStatic(GoEcFallback reason, {bool fade = false}) {
     _controller.stop();
     // After the frame, so the listener may call setState.
@@ -271,11 +368,15 @@ class _GoEcIntroState extends State<GoEcIntro> with TickerProviderStateMixin {
     _frozen.value = _clock.value;
     _clock.value = _Timeline.settled;
     if (fade) _fadeIn.forward(from: 0);
-    _hold = Timer(widget.staticHold + (fade ? _fadeDur : Duration.zero), _leaveStatic);
+    _hold = Timer(widget.staticHold + (fade ? _fadeDur : Duration.zero), () {
+      _staticHeld = true;
+      _tryLeaveStatic();
+    });
   }
 
-  void _leaveStatic() {
-    if (!mounted) return;
+  void _tryLeaveStatic() {
+    if (!mounted || !_staticHeld || !_mayGo || _leaving) return;
+    _leaving = true;
     _showChild.value = true;
     _fadeOut.forward().whenCompleteOrCancel(_finish);
   }
@@ -290,7 +391,9 @@ class _GoEcIntroState extends State<GoEcIntro> with TickerProviderStateMixin {
   @override
   void dispose() {
     _hold?.cancel();
+    _deadline?.cancel();
     _controller.dispose();
+    _pulse.dispose();
     _fadeIn.dispose();
     _fadeOut.dispose();
     _clock.dispose();
@@ -299,8 +402,10 @@ class _GoEcIntroState extends State<GoEcIntro> with TickerProviderStateMixin {
     super.dispose();
   }
 
-  Widget _paint(ValueListenable<double> clock, {required bool dive}) =>
-      CustomPaint(painter: _IntroPainter(clock, roll: widget.rollLetters, dive: dive), size: Size.infinite);
+  Widget _paint(ValueListenable<double> clock, {required bool dive}) => CustomPaint(
+        painter: _IntroPainter(clock, dive ? _pulse : kAlwaysDismissedAnimation, roll: widget.rollLetters, dive: dive),
+        size: Size.infinite,
+      );
 
   @override
   Widget build(BuildContext context) {
@@ -335,9 +440,13 @@ class _GoEcIntroState extends State<GoEcIntro> with TickerProviderStateMixin {
 }
 
 class _IntroPainter extends CustomPainter {
-  _IntroPainter(this.clock, {required this.roll, required this.dive}) : super(repaint: clock);
+  _IntroPainter(this.clock, this.pulse, {required this.roll, required this.dive})
+      : super(repaint: Listenable.merge([clock, pulse]));
 
   final ValueListenable<double> clock;
+
+  /// Waiting on the bolt for the child: 0 → 1 per glow, 0 when not waiting.
+  final Animation<double> pulse;
   final bool roll;
   final bool dive;
 
@@ -405,6 +514,17 @@ class _IntroPainter extends CustomPainter {
       ], const [0, 0.45, 1]);
     }
 
+    // Waiting for the child: a soft glow swells and fades once per cycle (a cosine, so it
+    // starts and ends at rest and never snaps on or off).
+    final wait = (1 - math.cos(2 * math.pi * pulse.value)) / 2;
+    if (wait > 0) {
+      _radial(canvas, _g, 880, [
+        GoEcColors.green.withAlpha((0.5 * wait * 255).round()),
+        GoEcColors.green.withAlpha((0.17 * wait * 255).round()),
+        GoEcColors.green.withAlpha(0),
+      ], const [0, 0.45, 1]);
+    }
+
     // Ring turns into place.
     final ringP = _brake.transform(_progress(ms, _Timeline.ringStart, _Timeline.ringDur));
     _inMark(canvas, () {
@@ -449,8 +569,9 @@ class _IntroPainter extends CustomPainter {
     }
 
     // Bolt lights green, then (during the dive) a blue cover fades off the cut-out
-    // so the next screen appears inside it.
-    final boltA = sparkMs < 0 ? 0.0 : _keyed(_boltKeys, sparkMs);
+    // so the next screen appears inside it. While waiting it brightens with the glow.
+    final sparkBolt = sparkMs < 0 ? 0.0 : _keyed(_boltKeys, sparkMs);
+    final boltA = sparkBolt + (1 - sparkBolt) * wait;
     final coverA = portalOpen ? 1 - ((ms - _Timeline.portalOpen) / _Timeline.portalFade).clamp(0.0, 1.0) : 0.0;
     if (boltA > 0 || coverA > 0) {
       _inMark(canvas, () {
@@ -537,5 +658,6 @@ class _IntroPainter extends CustomPainter {
   }
 
   @override
-  bool shouldRepaint(_IntroPainter old) => old.roll != roll || old.dive != dive || old.clock != clock;
+  bool shouldRepaint(_IntroPainter old) =>
+      old.roll != roll || old.dive != dive || old.clock != clock || old.pulse != pulse;
 }

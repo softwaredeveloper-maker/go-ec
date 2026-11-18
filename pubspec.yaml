@@ -1,6 +1,6 @@
 name: goec_intro
 description: Go EC app launch intro. The logo is drawn from geometry, no image assets.
-version: 0.1.0
+version: 0.2.0
 publish_to: none
 
 environment:
